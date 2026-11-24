@@ -1,0 +1,799 @@
+import os
+import re
+import sys
+import json
+import shutil
+import random
+import subprocess
+import tomllib
+import atexit
+import urllib.request
+import urllib.parse
+from pathlib import Path
+from textual.app import App, ComposeResult
+from textual.screen import ModalScreen
+from textual.widgets import Header, Footer, ListView, ListItem, Label, Input, Button
+from textual.containers import Horizontal, Vertical, Grid
+from textual.binding import Binding
+from just_playback import Playback
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import ID3NoHeaderError
+
+# Ścieżka do aktywnego motywu w Omarchy
+OMARCHY_COLORS_PATH = Path.home() / ".config" / "omarchy" / "current" / "theme" / "colors.toml"
+
+def load_strict_omarchy_colors():
+    """Wczytuje kolory z Omarchy, a w razie braku pliku używa Twojej ziemistej palety wygenerowanej przez Aether."""
+    fallback_colors = {
+        "background": "transparent",
+        "foreground": "#A8A890",
+        "accent": "#F7DFB1",
+        "color1": "#C3C67C",
+        "color4": "#5E8B5A"
+    }
+    
+    if not OMARCHY_COLORS_PATH.exists():
+        return fallback_colors
+        
+    try:
+        with open(OMARCHY_COLORS_PATH, "rb") as f:
+            theme_data = tomllib.load(f)
+            return {
+                "background": "transparent",
+                "foreground": theme_data.get("foreground", fallback_colors["foreground"]),
+                "accent": theme_data.get("accent", fallback_colors["accent"]),
+                "color1": theme_data.get("color1", theme_data.get("accent", fallback_colors["color1"])),
+                "color4": theme_data.get("color4", theme_data.get("accent", fallback_colors["color4"]))
+            }
+    except Exception:
+        return fallback_colors
+
+COLORS = load_strict_omarchy_colors()
+
+
+def clean_filename_for_search(filename: str) -> str:
+    """Usuwa śmieci z nazw plików pobranych z YouTube przed wysłaniem zapytania do Deezera."""
+    name = filename
+    # Usuwa nawiasy z dopiskami typu (Audio), [Official Video], (2014 Remastered)
+    name = re.sub(r"[\(\[].*?[\)\]]", "", name)
+    # Usuwa popularne dopiski ze stron do pobierania
+    name = re.sub(r"(?i)(snapyt\.app|y2mate\.com|official video|official audio|lyrics|hd|4k)", "", name)
+    # Zamienia podkreślenia i myślniki na spacje
+    name = re.sub(r"[_-]+", " ", name)
+    # Rozdziela sklejone wyrazy CamelCase (np. DługośćDźwiękuSamotności -> Długość Dźwięku Samotności)
+    name = re.sub(r"(?<=[a-ząćęłńóśźż])(?=[A-ZĄĆĘŁŃÓŚŹŻ])", " ", name)
+    return " ".join(name.split()).strip()
+
+
+def fetch_deezer_metadata(query: str) -> dict | None:
+    """Pyta darmowe API Deezera o metadane utworu."""
+    if not query:
+        return None
+    try:
+        encoded_q = urllib.parse.quote(query)
+        url = f"https://api.deezer.com/search?q={encoded_q}&limit=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "Termusic/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            tracks = data.get("data", [])
+            if tracks:
+                track = tracks[0]
+                return {
+                    "title": track.get("title", ""),
+                    "artist": track.get("artist", {}).get("name", ""),
+                    "album": track.get("album", {}).get("title", "")
+                }
+    except Exception:
+        pass
+    return None
+
+
+def read_mp3_tags(song_path: Path) -> dict:
+    """Odczytuje tagi ID3 z pliku MP3."""
+    try:
+        audio = EasyID3(str(song_path))
+        title = audio.get("title", [""])[0].strip()
+        artist = audio.get("artist", [""])[0].strip()
+        album = audio.get("album", [""])[0].strip()
+        return {"title": title, "artist": artist, "album": album}
+    except Exception:
+        return {"title": "", "artist": "", "album": ""}
+
+
+def write_mp3_tags(song_path: Path, title: str, artist: str, album: str) -> bool:
+    """Zapisuje tagi ID3 bezpośrednio do pliku MP3."""
+    try:
+        try:
+            audio = EasyID3(str(song_path))
+        except ID3NoHeaderError:
+            audio = EasyID3()
+            audio.save(str(song_path))
+            audio = EasyID3(str(song_path))
+        if title:
+            audio["title"] = title
+        if artist:
+            audio["artist"] = artist
+        if album:
+            audio["album"] = album
+        audio.save(str(song_path))
+        return True
+    except Exception:
+        return False
+
+
+class AddPlaylistModal(ModalScreen[str]):
+    CSS = f"""
+    AddPlaylistModal {{ align: center middle; background: rgba(0, 0, 0, 0.7); }}
+    #dialog {{ width: 45; height: 7; background: #000000; border: solid {COLORS.get('color4')}; padding: 1; align: center middle; }}
+    #dialog > Label {{ text-style: bold; color: {COLORS.get('accent')}; margin-bottom: 1; }}
+    Input {{ border: tall {COLORS.get('color4')}; background: transparent; color: {COLORS.get('foreground')}; }}
+    """
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Enter playlist name:")
+            yield Input(placeholder="My Awesome Playlist", id="playlist-input")
+    def on_mount(self) -> None: self.query_one("#playlist-input").focus()
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() if event.value.strip() else "")
+
+
+class DownloadYoutubeModal(ModalScreen[str]):
+    CSS = f"""
+    DownloadYoutubeModal {{ align: center middle; background: rgba(0, 0, 0, 0.7); }}
+    #dialog-yt {{ width: 60; height: 7; background: #000000; border: solid {COLORS.get('color4')}; padding: 1; align: center middle; }}
+    #dialog-yt > Label {{ text-style: bold; color: {COLORS.get('accent')}; margin-bottom: 1; }}
+    Input {{ border: tall {COLORS.get('color4')}; background: transparent; color: {COLORS.get('foreground')}; }}
+    """
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog-yt"):
+            yield Label("Enter YouTube Link:")
+            yield Input(placeholder="https://www.youtube.com/watch?v=...", id="yt-input")
+    def on_mount(self) -> None: self.query_one("#yt-input").focus()
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() if event.value.strip() else "")
+
+
+class DeleteConfirmModal(ModalScreen[bool]):
+    CSS = f"""
+    DeleteConfirmModal {{ align: center middle; background: rgba(0, 0, 0, 0.7); }}
+    #confirm-dialog {{ width: 50; height: 8; background: #000000; border: solid {COLORS.get('color4')}; padding: 1; align: center middle; }}
+    #confirm-dialog > Label {{ text-align: center; text-style: bold; color: {COLORS.get('foreground')}; margin-bottom: 1; }}
+    #button-row {{ height: 3; align: center middle; }}
+    Button {{ margin: 0 1; width: 12; }}
+    #btn-yes {{ background: {COLORS.get('color1')}; color: #000000; }}
+    #btn-no {{ background: {COLORS.get('color4')}; color: #000000; }}
+    """
+    def __init__(self, item_name: str, is_song: bool = False):
+        super().__init__()
+        self.item_name = item_name
+        self.is_song = is_song
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-dialog"):
+            item_type = "song" if self.is_song else "album/playlist"
+            yield Label(f"Are you sure you want to delete\n{item_type} '{self.item_name}'?")
+            with Horizontal(id="button-row"):
+                yield Button("Yes", id="btn-yes")
+                yield Button("No", id="btn-no")
+    def on_mount(self) -> None: self.query_one("#btn-no").focus()
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-yes": self.dismiss(True)
+        elif event.button.id == "btn-no": self.dismiss(False)
+
+
+class Termusic(App):
+    CSS = f"""
+    /* Wymuszamy CAŁKOWITĄ przezroczystość na poziomie samej aplikacji i głównego ekranu */
+    App, Screen {{ background: transparent; }}
+    * {{ scrollbar-size: 0 0; background: transparent; }} 
+    
+    #layout {{ height: 1fr; background: transparent; }}
+    #left-sidebar {{ width: 1fr; height: 100%; grid-size: 1 2; grid-rows: 1fr 1fr; background: transparent; }}
+    
+    /* Ujednolicone ramki kontenerów */
+    .column {{ border: solid {COLORS.get('color4')}; background: transparent; margin: 1; padding: 1; }}
+    #visualizer-container {{ align: center bottom; background: transparent; }}
+    #songs-container {{ width: 1fr; height: 100%; background: transparent; }}
+    
+    /* Kontener dolny */
+    #now-playing-container {{ height: 5; border: solid {COLORS.get('color4')}; background: transparent; margin: 0 1 1 1; padding: 0 1; }}
+    
+    /* Słupki audio */
+    #visualizer-display {{ color: {COLORS.get('color1')}; text-align: center; width: 100%; height: 100%; content-align: center bottom; background: transparent; }}
+    
+    #modes-row {{ height: 1; width: 100%; text-align: center; text-style: bold; color: {COLORS.get('foreground')}; background: transparent; }}
+    
+    /* Grid statusu */
+    #status-row {{ layout: grid; grid-size: 3 1; grid-columns: 1fr 2fr 1fr; width: 100%; height: 1; background: transparent; }}
+    #now-playing {{ text-align: center; text-style: bold; color: {COLORS.get('accent')}; width: 100%; background: transparent; }}
+    #volume-display {{ text-align: right; color: {COLORS.get('foreground')}; width: 100%; background: transparent; }}
+    
+    /* Pasek postępu */
+    #custom-progress-bar {{ width: 100%; height: 1; background: transparent; color: {COLORS.get('foreground')}; text-align: center; }}
+    
+    /* Zabezpieczenie przed domyślnym tłem list */
+    ListView {{ background: transparent; }}
+    ListView > ListItem {{ padding: 0 1; border-left: tall transparent; background: transparent; color: {COLORS.get('foreground')}; }}
+    ListView > ListItem.--highlight {{ background: transparent; color: {COLORS.get('foreground')}; text-style: bold; }}
+    
+    /* Aktywny element */
+    .active-item {{ 
+        background: transparent !important; 
+        border-left: tall {COLORS.get('color1')} !important; 
+        color: {COLORS.get('foreground')} !important; 
+        text-style: bold !important; 
+    }}
+    
+    Header {{ background: transparent; color: {COLORS.get('accent')}; }}
+    Footer {{ background: transparent; color: {COLORS.get('foreground')}; }}
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("space", "toggle_pause", "Pause/Play"),
+        Binding("escape", "back_to_playlists", "Back"),
+        Binding("{", "volume_down", "Vol -5%"),
+        Binding("}", "volume_up", "Vol +5%"),
+        Binding("a", "add_or_download", "Add/YT"),
+        Binding("d", "delete_item", "Delete"),
+        Binding("s", "auto_tag_deezer", "Auto-Tag"),
+        Binding(">", "next_song", "Next"),
+        Binding("<", "prev_song", "Prev"),
+        Binding("L", "toggle_loop", "Loop"),
+        Binding("R", "toggle_random", "Random"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.music_dir = Path.home() / "Music"
+        self.playlists = {}  # { "Nazwa Albumu": [ {"path": Path, "display": str, "title": str, "artist": str, "album": str}, ... ] }
+        self.active_playlist = None
+        self.current_song_index = -1
+        self.active_song_name = "music"
+        
+        self.setup_isolated_audio()
+        
+        self.playback = Playback()
+        self.volume = 1.0
+        self.is_loop_active = False
+        self.is_random_active = False
+        self.spectrum_buffer = []
+        self.cava_process = None
+        self.scan_music()
+
+    def setup_isolated_audio(self) -> None:
+        self.pa_sink_id = None
+        self.pa_loopback_id = None
+        try:
+            sink_proc = subprocess.run(
+                ["pactl", "load-module", "module-null-sink", "sink_name=TerminalMusicSink", "sink_properties=device.description=TerminalMusic"],
+                capture_output=True, text=True, check=True
+            )
+            self.pa_sink_id = sink_proc.stdout.strip()
+
+            loop_proc = subprocess.run(
+                ["pactl", "load-module", "module-loopback", "source=TerminalMusicSink.monitor"],
+                capture_output=True, text=True, check=True
+            )
+            self.pa_loopback_id = loop_proc.stdout.strip()
+
+            os.environ["PULSE_SINK"] = "TerminalMusicSink"
+            atexit.register(self.cleanup_isolated_audio)
+        except Exception:
+            pass
+
+    def cleanup_isolated_audio(self) -> None:
+        if getattr(self, 'pa_sink_id', None):
+            subprocess.run(["pactl", "unload-module", self.pa_sink_id], stderr=subprocess.DEVNULL)
+            self.pa_sink_id = None
+        if getattr(self, 'pa_loopback_id', None):
+            subprocess.run(["pactl", "unload-module", self.pa_loopback_id], stderr=subprocess.DEVNULL)
+            self.pa_loopback_id = None
+
+    def scan_music(self) -> None:
+        """Skanuje rekurencyjnie ~/Music i grupuje utwory po tagu Album (lub nazwie folderu, jeśli brak tagu)."""
+        if not self.music_dir.exists():
+            self.music_dir.mkdir(parents=True, exist_ok=True)
+            
+        grouped = {}
+        
+        # Zachowaj puste foldery, jeśli użytkownik ręcznie stworzył playlistę
+        for path in sorted(self.music_dir.iterdir()):
+            if path.is_dir() and not list(path.glob("*.mp3")):
+                grouped[path.name] = []
+
+        # Przeskanuj wszystkie pliki .mp3
+        for mp3_path in sorted(self.music_dir.rglob("*.mp3")):
+            tags = read_mp3_tags(mp3_path)
+            album = tags["album"]
+            artist = tags["artist"]
+            title = tags["title"]
+            
+            # Jeśli brak tagu albumu, użyj nazwy folderu nadrzędnego
+            if not album:
+                album = mp3_path.parent.name if mp3_path.parent != self.music_dir else "Unsorted"
+                
+            if artist and title:
+                display = f"{artist} - {title}"
+            elif title:
+                display = title
+            else:
+                display = mp3_path.stem
+                
+            grouped.setdefault(album, []).append({
+                "path": mp3_path,
+                "display": display,
+                "title": title,
+                "artist": artist,
+                "album": album
+            })
+
+        # Posortuj albumy i utwory alfabetycznie
+        self.playlists = {
+            k: sorted(v, key=lambda x: x["display"].lower())
+            for k, v in sorted(grouped.items(), key=lambda item: item[0].lower())
+        }
+
+    def compose(self) -> ComposeResult:
+        title_color = COLORS.get('accent')
+        hint_color = COLORS.get('foreground')
+        
+        yield Header(show_clock=True)
+        with Horizontal(id="layout"):
+            with Grid(id="left-sidebar"):
+                with Vertical(classes="column", id="playlists-container"):
+                    yield Label(f"[bold {title_color}]ALBUMS / PLAYLISTS[/]\n[{hint_color}](Press 's' Auto-Tag | 'a' Add | 'd' Del)[/]")
+                    yield ListView(id="playlist-list")
+                with Vertical(classes="column", id="visualizer-container"):
+                    yield Label(f"[bold {title_color}]LIVE AUDIO SPECTRUM[/]")
+                    yield Label("", id="visualizer-display")
+            with Vertical(classes="column", id="songs-container"):
+                yield Label(f"[bold {title_color}]TRACKS[/]\n[{hint_color}](Press 'a' Download YT | 'd' Delete)[/]")
+                yield ListView(id="song-list")
+        with Vertical(id="now-playing-container"):
+            yield Label("", id="modes-row")
+            with Horizontal(id="status-row"):
+                yield Label("") 
+                yield Label("Status: Not playing", id="now-playing")
+                yield Label("[100%]", id="volume-display")
+            yield Label("00:00 ──────────────────────────────────────── 00:00", id="custom-progress-bar")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_playlists_ui()
+        self.query_one("#playlist-list").focus()
+        self.set_interval(0.04, self.update_playback_and_visualizer)
+        self.update_modes_ui()
+        self.run_worker(self.cava_listener_worker, thread=True)
+
+    def update_active_highlight(self) -> None:
+        playlist_names = list(self.playlists.keys())
+        try:
+            active_idx = playlist_names.index(self.active_playlist)
+        except ValueError:
+            active_idx = -1
+
+        for i, item in enumerate(self.query("#playlist-list ListItem")):
+            item.remove_class("active-item")
+            if i == active_idx:
+                item.add_class("active-item")
+        
+        for i, item in enumerate(self.query("#song-list ListItem")):
+            item.remove_class("active-item")
+            if i == self.current_song_index:
+                item.add_class("active-item")
+
+    def action_auto_tag_deezer(self) -> None:
+        """Uruchamia w tle rozpoznawanie nieotagowanych utworów przez Deezer API."""
+        self.query_one("#now-playing", Label).update("🔍 Scanning library with Deezer API...")
+        
+        def tagger_worker():
+            all_mp3s = list(self.music_dir.rglob("*.mp3"))
+            to_tag = []
+            for p in all_mp3s:
+                tags = read_mp3_tags(p)
+                if not tags["album"] or not tags["artist"] or not tags["title"]:
+                    to_tag.append(p)
+            
+            if not to_tag:
+                self.call_from_thread(self.on_tagging_finished, 0, 0)
+                return
+                
+            tagged_count = 0
+            total = len(to_tag)
+            for idx, mp3_path in enumerate(to_tag, start=1):
+                self.call_from_thread(
+                    self.update_status_text,
+                    f"🔍 Deezer ({idx}/{total}): {mp3_path.stem[:35]}..."
+                )
+                query = clean_filename_for_search(mp3_path.stem)
+                meta = fetch_deezer_metadata(query)
+                if meta and meta["album"]:
+                    if write_mp3_tags(mp3_path, meta["title"], meta["artist"], meta["album"]):
+                        tagged_count += 1
+                        
+            self.call_from_thread(self.on_tagging_finished, tagged_count, total)
+            
+        self.run_worker(tagger_worker, thread=True)
+
+    def update_status_text(self, text: str) -> None:
+        self.query_one("#now-playing", Label).update(text)
+
+    def on_tagging_finished(self, tagged_count: int, total: int) -> None:
+        self.scan_music()
+        self.refresh_playlists_ui()
+        if self.active_playlist and self.active_playlist in self.playlists:
+            self.load_songs_to_ui(self.active_playlist)
+        else:
+            self.query_one("#song-list", ListView).clear()
+        self.update_active_highlight()
+        
+        if total == 0:
+            self.query_one("#now-playing", Label).update("✅ All tracks are already tagged!")
+        else:
+            self.query_one("#now-playing", Label).update(f"✅ Auto-tagged {tagged_count}/{total} tracks via Deezer!")
+
+    def cava_listener_worker(self) -> None:
+        bars_count = 200 
+        self.spectrum_buffer = [0.0] * bars_count
+        
+        cava_conf = f"""
+[general]
+bars = {bars_count}
+framerate = 30
+
+[input]
+method = pulse
+source = TerminalMusicSink.monitor
+
+[output]
+method = raw
+raw_target = /dev/stdout
+data_format = ascii
+ascii_max_range = 1000
+        """
+        conf_path = Path.home() / ".config" / "cava" / "player_tui_auto_conf"
+        conf_path.parent.mkdir(parents=True, exist_ok=True)
+        conf_path.write_text(cava_conf.strip())
+
+        self.cava_process = subprocess.Popen(
+            ["cava", "-p", str(conf_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1 
+        )
+
+        while self.cava_process and self.cava_process.poll() is None:
+            line = self.cava_process.stdout.readline()
+            if not line: continue
+            try:
+                values = [int(v) for v in line.strip().split(';') if v]
+                for i, val in enumerate(values):
+                    if i < bars_count:
+                        self.spectrum_buffer[i] = val / 1000.0
+            except Exception:
+                pass
+
+    def refresh_playlists_ui(self) -> None:
+        playlist_list = self.query_one("#playlist-list", ListView)
+        playlist_list.clear()
+        for name in self.playlists.keys():
+            playlist_list.append(ListItem(Label(name)))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        list_id = event.list_view.id
+        if list_id == "playlist-list":
+            playlist_names = list(self.playlists.keys())
+            playlist_index = event.list_view.index
+            if playlist_index is not None and 0 <= playlist_index < len(playlist_names):
+                self.active_playlist = playlist_names[playlist_index]
+                self.load_songs_to_ui(self.active_playlist)
+                self.update_active_highlight()
+                self.query_one("#song-list").focus()
+        elif list_id == "song-list":
+            song_index = event.list_view.index
+            if self.active_playlist and song_index is not None:
+                songs = self.playlists.get(self.active_playlist, [])
+                if 0 <= song_index < len(songs):
+                    self.play_song(songs[song_index], song_index)
+
+    def action_add_or_download(self) -> None:
+        playlist_list = self.query_one("#playlist-list", ListView)
+        song_list = self.query_one("#song-list", ListView)
+        if playlist_list.has_focus:
+            def handle_modal_result(playlist_name: str) -> None:
+                if playlist_name:
+                    new_dir = self.music_dir / playlist_name
+                    try:
+                        new_dir.mkdir(exist_ok=False)
+                        self.scan_music()
+                        self.refresh_playlists_ui()
+                    except FileExistsError: pass
+            self.push_screen(AddPlaylistModal(), handle_modal_result)
+        elif song_list.has_focus:
+            def handle_yt_result(url: str) -> None:
+                if url: self.download_youtube_song(url)
+            self.push_screen(DownloadYoutubeModal(), handle_yt_result)
+
+    def download_youtube_song(self, url: str) -> None:
+        # Zapisujemy do folderu aktywnej playlisty (jeśli istnieje jako folder) lub do ~/Music/Downloads
+        if self.active_playlist and (self.music_dir / self.active_playlist).is_dir():
+            target_dir = self.music_dir / self.active_playlist
+        else:
+            target_dir = self.music_dir / "Downloads"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            
+        self.query_one("#now-playing", Label).update("⏳ Downloading from YouTube... Please wait")
+        
+        before_files = set(target_dir.glob("*.mp3"))
+        command = [
+            "/usr/bin/yt-dlp",
+            "--ffmpeg-location", "/usr/bin/ffmpeg",
+            "-x",
+            "--audio-format", "mp3",
+            "-o", f"{target_dir}/%(title)s.%(ext)s",
+            url
+        ]
+        
+        def run_downloader():
+            try:
+                result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    # Od razu rozpoznaj nowy plik przez Deezer API
+                    after_files = set(target_dir.glob("*.mp3"))
+                    new_files = after_files - before_files
+                    for new_mp3 in new_files:
+                        self.call_from_thread(self.update_status_text, f"🔍 Tagging via Deezer: {new_mp3.stem[:30]}...")
+                        query = clean_filename_for_search(new_mp3.stem)
+                        meta = fetch_deezer_metadata(query)
+                        if meta and meta["album"]:
+                            write_mp3_tags(new_mp3, meta["title"], meta["artist"], meta["album"])
+                    self.call_from_thread(self.on_download_success)
+                else:
+                    self.call_from_thread(self.on_download_error, "❌ Download failed (yt-dlp error)")
+            except Exception:
+                self.call_from_thread(self.on_download_error, "❌ System error")
+        self.run_worker(run_downloader, thread=True)
+
+    def on_download_success(self) -> None:
+        self.scan_music()
+        self.refresh_playlists_ui()
+        if self.active_playlist and self.active_playlist in self.playlists:
+            self.load_songs_to_ui(self.active_playlist)
+        self.query_one("#now-playing", Label).update("✅ Download & auto-tag complete!")
+
+    def on_download_error(self, message: str) -> None:
+        self.query_one("#now-playing", Label).update(message)
+
+    def action_delete_item(self) -> None:
+        playlist_list = self.query_one("#playlist-list", ListView)
+        song_list = self.query_one("#song-list", ListView)
+        if playlist_list.has_focus:
+            playlist_names = list(self.playlists.keys())
+            playlist_index = playlist_list.index
+            if playlist_index is not None and 0 <= playlist_index < len(playlist_names):
+                playlist_to_delete = playlist_names[playlist_index]
+                def handle_delete_confirm(confirmed: bool) -> None:
+                    if confirmed:
+                        try:
+                            self.playback.stop()
+                            folder_path = self.music_dir / playlist_to_delete
+                            if folder_path.is_dir():
+                                shutil.rmtree(folder_path)
+                            else:
+                                for song in self.playlists.get(playlist_to_delete, []):
+                                    if song["path"].exists():
+                                        os.remove(song["path"])
+                            self.scan_music()
+                            self.refresh_playlists_ui()
+                            self.query_one("#song-list", ListView).clear()
+                        except Exception: pass
+                self.push_screen(DeleteConfirmModal(playlist_to_delete, is_song=False), handle_delete_confirm)
+        elif song_list.has_focus:
+            if not self.active_playlist: return
+            songs = self.playlists.get(self.active_playlist, [])
+            song_index = song_list.index
+            if song_index is not None and 0 <= song_index < len(songs):
+                song_to_delete = songs[song_index]
+                def handle_song_delete_confirm(confirmed: bool) -> None:
+                    if confirmed:
+                        try:
+                            self.playback.stop()
+                            os.remove(song_to_delete["path"])
+                            self.scan_music()
+                            self.refresh_playlists_ui()
+                            if self.active_playlist in self.playlists:
+                                self.load_songs_to_ui(self.active_playlist)
+                            else:
+                                self.query_one("#song-list", ListView).clear()
+                            self.query_one("#now-playing", Label).update("Status: Not playing")
+                        except Exception: pass
+                self.push_screen(DeleteConfirmModal(song_to_delete["display"], is_song=True), handle_song_delete_confirm)
+
+    def load_songs_to_ui(self, playlist_name: str) -> None:
+        song_list_view = self.query_one("#song-list", ListView)
+        song_list_view.clear()
+        songs = self.playlists.get(playlist_name, [])
+        for i, song in enumerate(songs):
+            song_list_view.append(ListItem(Label(f"{i+1}. {song['display']}")))
+
+    def play_song(self, song_info: dict, index: int = -1) -> None:
+        song_path = song_info["path"]
+        self.playback.load_file(str(song_path))
+        self.playback.set_volume(self.volume)
+        self.playback.play()
+        
+        self.active_song_name = song_info["display"]
+        self.query_one("#now-playing", Label).update(f"🎶 Playing: {self.active_song_name}")
+        self.update_progress_ui(0)
+        
+        if index == -1:
+            songs = self.playlists.get(self.active_playlist, [])
+            for idx, s in enumerate(songs):
+                if s["path"] == song_path:
+                    self.current_song_index = idx
+                    break
+        else:
+            self.current_song_index = index
+
+        self.update_active_highlight()
+        
+        song_list = self.query_one("#song-list", ListView)
+        if 0 <= self.current_song_index < len(song_list.children):
+            song_list.index = self.current_song_index
+
+    def action_next_song(self) -> None:
+        if not self.active_playlist: return
+        songs = self.playlists.get(self.active_playlist, [])
+        if not songs: return
+        
+        if self.is_random_active:
+            self.current_song_index = random.randint(0, len(songs) - 1)
+        else:
+            self.current_song_index += 1
+            if self.current_song_index >= len(songs):
+                if self.is_loop_active:
+                    self.current_song_index = 0
+                else:
+                    self.current_song_index = len(songs) - 1
+                    return
+        self.play_song(songs[self.current_song_index], self.current_song_index)
+
+    def action_prev_song(self) -> None:
+        if not self.active_playlist: return
+        songs = self.playlists.get(self.active_playlist, [])
+        if not songs: return
+        
+        self.current_song_index -= 1
+        if self.current_song_index < 0:
+            if self.is_loop_active:
+                self.current_song_index = len(songs) - 1
+            else:
+                self.current_song_index = 0
+        self.play_song(songs[self.current_song_index], self.current_song_index)
+
+    def action_toggle_loop(self) -> None:
+        self.is_loop_active = not self.is_loop_active
+        self.update_modes_ui()
+
+    def action_toggle_random(self) -> None:
+        self.is_random_active = not self.is_random_active
+        self.update_modes_ui()
+
+    def update_modes_ui(self) -> None:
+        active_modes = []
+        if self.is_loop_active: active_modes.append("[L] (Loop)")
+        if self.is_random_active: active_modes.append("[R] (Random)")
+        self.query_one("#modes-row", Label).update(" • ".join(active_modes) if active_modes else "")
+
+    def format_time(self, seconds: float) -> str:
+        if seconds is None or seconds < 0: return "00:00"
+        m, s = divmod(int(seconds), 60)
+        return f"{m:02d}:{s:02d}"
+
+    def update_playback_and_visualizer(self) -> None:
+        if self.playback.active and self.playback.playing and self.playback.duration > 0:
+            if self.playback.curr_pos >= self.playback.duration - 0.2:
+                self.action_next_song()
+                return
+            self.update_progress_ui(self.playback.curr_pos / self.playback.duration)
+            self.render_live_audio_spectrum(is_playing=True)
+        else:
+            self.update_progress_ui(0.0)
+            self.render_live_audio_spectrum(is_playing=False)
+
+    def render_live_audio_spectrum(self, is_playing: bool) -> None:
+        try:
+            display_label = self.query_one("#visualizer-display", Label)
+            width = display_label.size.width - 2
+            total_height = display_label.size.height
+            
+            if width <= 0 or total_height <= 0 or not self.spectrum_buffer:
+                return
+
+            bars_to_draw = min(width // 2, len(self.spectrum_buffer))
+            lines = []
+            
+            for y in reversed(range(total_height)):
+                line_chars = []
+                for x in range(width):
+                    bar_idx = x // 2
+                    
+                    if x % 2 == 1 or bar_idx >= bars_to_draw:
+                        line_chars.append(" ") 
+                    else:
+                        base_val = self.spectrum_buffer[bar_idx]
+                        boosted_val = (base_val ** 0.6) if base_val > 0 else 0
+                        raw_val = boosted_val * total_height * 2.4
+                        
+                        if raw_val >= y + 1:
+                            line_chars.append("█")
+                        elif raw_val > y:
+                            fraction = raw_val - y
+                            block_idx = int(fraction * 8)
+                            blocks = [" ", " ", "▂", "▃", "▄", "▅", "▆", "▇"]
+                            line_chars.append(blocks[block_idx] if block_idx < 8 else "▇")
+                        else:
+                            line_chars.append(" ")
+                            
+                lines.append("".join(line_chars))
+
+            display_label.update("\n".join(lines))
+        except Exception:
+            pass
+
+    def update_progress_ui(self, percentage: float) -> None:
+        try:
+            bar_label = self.query_one("#custom-progress-bar", Label)
+            
+            width = bar_label.size.width
+            if width <= 0: width = self.console.width - 6
+            if width <= 0: width = 80
+                
+            curr_pos = self.playback.curr_pos if self.playback.active else 0.0
+            duration = self.playback.duration if self.playback.active else 0.0
+            elapsed_str = self.format_time(curr_pos)
+            duration_str = self.format_time(duration)
+            
+            overhead = len(elapsed_str) + len(duration_str) + 2
+            bar_width = width - overhead
+            
+            if bar_width > 0:
+                filled_length = int(round(bar_width * min(1.0, max(0.0, percentage))))
+                empty_length = bar_width - filled_length
+                bar_blocks = "█" * filled_length + "─" * empty_length
+                bar_label.update(f"{elapsed_str} {bar_blocks} {duration_str}")
+        except Exception:
+            pass
+
+    def action_volume_up(self) -> None:
+        self.volume = min(1.0, self.volume + 0.05)
+        self.playback.set_volume(self.volume)
+        self.query_one("#volume-display", Label).update(f"[{int(round(self.volume * 100))}%]")
+
+    def action_volume_down(self) -> None:
+        self.volume = max(0.0, self.volume - 0.05)
+        self.playback.set_volume(self.volume)
+        self.query_one("#volume-display", Label).update(f"[{int(round(self.volume * 100))}%]")
+
+    def action_toggle_pause(self) -> None:
+        if self.playback.active:
+            if self.playback.playing:
+                self.playback.pause()
+                self.query_one("#now-playing", Label).update("⏸️ Paused")
+            else:
+                self.playback.resume()
+                song_name = getattr(self, 'active_song_name', 'music')
+                self.query_one("#now-playing", Label).update(f"🎶 Playing: {song_name}")
+
+    def action_back_to_playlists(self) -> None:
+        self.query_one("#playlist-list").focus()
+
+    def on_unmount(self) -> None:
+        self.playback.stop()
+        if self.cava_process:
+            self.cava_process.terminate()
+        self.cleanup_isolated_audio()
+
+if __name__ == "__main__":
+    Termusic().run()
