@@ -10,6 +10,7 @@ import atexit
 import urllib.request
 import urllib.parse
 from pathlib import Path
+from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.screen import ModalScreen
 from textual.widgets import Header, Footer, ListView, ListItem, Label, Input, Button
@@ -52,15 +53,11 @@ COLORS = load_strict_omarchy_colors()
 
 
 def clean_filename_for_search(filename: str) -> str:
-    """Usuwa śmieci z nazw plików pobranych z YouTube przed wysłaniem zapytania do Deezera."""
+    """Usuwa śmieci z nazw plików pobranych z YouTube przed wysłaniem zapytania do API."""
     name = filename
-    # Usuwa nawiasy z dopiskami typu (Audio), [Official Video], (2014 Remastered)
     name = re.sub(r"[\(\[].*?[\)\]]", "", name)
-    # Usuwa popularne dopiski ze stron do pobierania
     name = re.sub(r"(?i)(snapyt\.app|y2mate\.com|official video|official audio|lyrics|hd|4k)", "", name)
-    # Zamienia podkreślenia i myślniki na spacje
     name = re.sub(r"[_-]+", " ", name)
-    # Rozdziela sklejone wyrazy CamelCase (np. DługośćDźwiękuSamotności -> Długość Dźwięku Samotności)
     name = re.sub(r"(?<=[a-ząćęłńóśźż])(?=[A-ZĄĆĘŁŃÓŚŹŻ])", " ", name)
     return " ".join(name.split()).strip()
 
@@ -86,6 +83,86 @@ def fetch_deezer_metadata(query: str) -> dict | None:
     except Exception:
         pass
     return None
+
+
+def parse_lrc(lrc_text: str) -> list[tuple[float, str]]:
+    """Parsuje tekst w formacie LRC na listę krotek (czas_w_sekundach, linijka)."""
+    lines = []
+    pattern = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)")
+    for raw_line in lrc_text.splitlines():
+        match = pattern.match(raw_line.strip())
+        if match:
+            mins = int(match.group(1))
+            secs = float(match.group(2))
+            text = match.group(3).strip()
+            if text:
+                lines.append((mins * 60.0 + secs, text))
+    return sorted(lines, key=lambda x: x[0])
+
+
+def fetch_lrclib_lyrics(song_path: Path, artist: str, title: str) -> tuple[list[tuple[float, str]], list[str]]:
+    """
+    Szuka tekstu utworu: najpierw w lokalnym pliku .lrc, potem w LRCLIB API.
+    Zwraca (synced_lines, plain_lines).
+    """
+    lrc_path = song_path.with_suffix(".lrc")
+    if lrc_path.exists():
+        try:
+            content = lrc_path.read_text(encoding="utf-8")
+            synced = parse_lrc(content)
+            if synced:
+                return synced, []
+            return [], [l.strip() for l in content.splitlines() if l.strip()]
+        except Exception:
+            pass
+
+    headers = {"User-Agent": "Termusic/1.0 (https://github.com/rudyyyv4/Termusic)"}
+    data = None
+
+    # 1. Dokładne wyszukiwanie po tagach artist + title
+    if artist and title:
+        try:
+            params = urllib.parse.urlencode({"artist_name": artist, "track_name": title})
+            url = f"https://lrclib.net/api/get?{params}"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            data = None
+
+    # 2. Wyszukiwanie ogólne po nazwie (fallback)
+    if not data:
+        query = f"{artist} {title}".strip() if (artist or title) else clean_filename_for_search(song_path.stem)
+        if query:
+            try:
+                params = urllib.parse.urlencode({"q": query})
+                url = f"https://lrclib.net/api/search?{params}"
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    results = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(results, list) and results:
+                        # Preferuj wynik z zsynchronizowanym tekstem
+                        data = next((r for r in results if r.get("syncedLyrics")), results[0])
+            except Exception:
+                data = None
+
+    if not data:
+        return [], []
+
+    synced_raw = data.get("syncedLyrics")
+    plain_raw = data.get("plainLyrics")
+
+    if synced_raw:
+        try:
+            lrc_path.write_text(synced_raw, encoding="utf-8")
+        except Exception:
+            pass
+        return parse_lrc(synced_raw), []
+
+    if plain_raw:
+        return [], [l.strip() for l in plain_raw.splitlines() if l.strip()]
+
+    return [], []
 
 
 def read_mp3_tags(song_path: Path) -> dict:
@@ -182,40 +259,37 @@ class DeleteConfirmModal(ModalScreen[bool]):
 
 class Termusic(App):
     CSS = f"""
-    /* Wymuszamy CAŁKOWITĄ przezroczystość na poziomie samej aplikacji i głównego ekranu */
     App, Screen {{ background: transparent; }}
     * {{ scrollbar-size: 0 0; background: transparent; }} 
     
     #layout {{ height: 1fr; background: transparent; }}
-    #left-sidebar {{ width: 1fr; height: 100%; grid-size: 1 2; grid-rows: 1fr 1fr; background: transparent; }}
+    #left-sidebar {{ width: 1fr; height: 100%; grid-size: 1 2; grid-rows: 1fr 1fr; grid-gutter: 0; background: transparent; }}
     
-    /* Ujednolicone ramki kontenerów */
+    /* Ujednolicone ramki i ciasne marginesy w lewej kolumnie */
     .column {{ border: solid {COLORS.get('color4')}; background: transparent; margin: 1; padding: 1; }}
-    #visualizer-container {{ align: center bottom; background: transparent; }}
+    #playlists-container {{ margin: 1 1 0 1; }}
+    #visualizer-container {{ margin: 0 1 1 1; align: center bottom; background: transparent; }}
     #songs-container {{ width: 1fr; height: 100%; background: transparent; }}
     
     /* Kontener dolny */
     #now-playing-container {{ height: 5; border: solid {COLORS.get('color4')}; background: transparent; margin: 0 1 1 1; padding: 0 1; }}
     
-    /* Słupki audio */
+    /* Słupki audio i tryb Lyrics */
     #visualizer-display {{ color: {COLORS.get('color1')}; text-align: center; width: 100%; height: 100%; content-align: center bottom; background: transparent; }}
+    #visualizer-display.lyrics-mode {{ color: {COLORS.get('foreground')}; content-align: center middle; }}
     
     #modes-row {{ height: 1; width: 100%; text-align: center; text-style: bold; color: {COLORS.get('foreground')}; background: transparent; }}
     
-    /* Grid statusu */
     #status-row {{ layout: grid; grid-size: 3 1; grid-columns: 1fr 2fr 1fr; width: 100%; height: 1; background: transparent; }}
     #now-playing {{ text-align: center; text-style: bold; color: {COLORS.get('accent')}; width: 100%; background: transparent; }}
     #volume-display {{ text-align: right; color: {COLORS.get('foreground')}; width: 100%; background: transparent; }}
     
-    /* Pasek postępu */
     #custom-progress-bar {{ width: 100%; height: 1; background: transparent; color: {COLORS.get('foreground')}; text-align: center; }}
     
-    /* Zabezpieczenie przed domyślnym tłem list */
     ListView {{ background: transparent; }}
     ListView > ListItem {{ padding: 0 1; border-left: tall transparent; background: transparent; color: {COLORS.get('foreground')}; }}
     ListView > ListItem.--highlight {{ background: transparent; color: {COLORS.get('foreground')}; text-style: bold; }}
     
-    /* Aktywny element */
     .active-item {{ 
         background: transparent !important; 
         border-left: tall {COLORS.get('color1')} !important; 
@@ -236,6 +310,7 @@ class Termusic(App):
         Binding("a", "add_or_download", "Add/YT"),
         Binding("d", "delete_item", "Delete"),
         Binding("s", "auto_tag_deezer", "Auto-Tag"),
+        Binding("ctrl+l", "toggle_visualizer_mode", "Lyrics/Spec"),
         Binding(">", "next_song", "Next"),
         Binding("<", "prev_song", "Prev"),
         Binding("L", "toggle_loop", "Loop"),
@@ -245,10 +320,16 @@ class Termusic(App):
     def __init__(self):
         super().__init__()
         self.music_dir = Path.home() / "Music"
-        self.playlists = {}  # { "Nazwa Albumu": [ {"path": Path, "display": str, "title": str, "artist": str, "album": str}, ... ] }
+        self.playlists = {}
         self.active_playlist = None
         self.current_song_index = -1
         self.active_song_name = "music"
+        self.active_song_path = None
+        
+        self.show_lyrics = False
+        self.synced_lyrics = []
+        self.plain_lyrics = []
+        self.lyrics_status = "Play a song to load lyrics"
         
         self.setup_isolated_audio()
         
@@ -290,25 +371,20 @@ class Termusic(App):
             self.pa_loopback_id = None
 
     def scan_music(self) -> None:
-        """Skanuje rekurencyjnie ~/Music i grupuje utwory po tagu Album (lub nazwie folderu, jeśli brak tagu)."""
         if not self.music_dir.exists():
             self.music_dir.mkdir(parents=True, exist_ok=True)
             
         grouped = {}
-        
-        # Zachowaj puste foldery, jeśli użytkownik ręcznie stworzył playlistę
         for path in sorted(self.music_dir.iterdir()):
             if path.is_dir() and not list(path.glob("*.mp3")):
                 grouped[path.name] = []
 
-        # Przeskanuj wszystkie pliki .mp3
         for mp3_path in sorted(self.music_dir.rglob("*.mp3")):
             tags = read_mp3_tags(mp3_path)
             album = tags["album"]
             artist = tags["artist"]
             title = tags["title"]
             
-            # Jeśli brak tagu albumu, użyj nazwy folderu nadrzędnego
             if not album:
                 album = mp3_path.parent.name if mp3_path.parent != self.music_dir else "Unsorted"
                 
@@ -327,7 +403,6 @@ class Termusic(App):
                 "album": album
             })
 
-        # Posortuj albumy i utwory alfabetycznie
         self.playlists = {
             k: sorted(v, key=lambda x: x["display"].lower())
             for k, v in sorted(grouped.items(), key=lambda item: item[0].lower())
@@ -344,7 +419,7 @@ class Termusic(App):
                     yield Label(f"[bold {title_color}]ALBUMS / PLAYLISTS[/]\n[{hint_color}](Press 's' Auto-Tag | 'a' Add | 'd' Del)[/]")
                     yield ListView(id="playlist-list")
                 with Vertical(classes="column", id="visualizer-container"):
-                    yield Label(f"[bold {title_color}]LIVE AUDIO SPECTRUM[/]")
+                    yield Label(f"[bold {title_color}]LIVE AUDIO SPECTRUM[/] [{hint_color}](Ctrl+L: Lyrics)[/]", id="visualizer-title")
                     yield Label("", id="visualizer-display")
             with Vertical(classes="column", id="songs-container"):
                 yield Label(f"[bold {title_color}]TRACKS[/]\n[{hint_color}](Press 'a' Download YT | 'd' Delete)[/]")
@@ -365,6 +440,91 @@ class Termusic(App):
         self.update_modes_ui()
         self.run_worker(self.cava_listener_worker, thread=True)
 
+    def action_toggle_visualizer_mode(self) -> None:
+        """Przełącza dolny lewy panel między CAVA Spectrum a tekstami piosenek (Ctrl+L)."""
+        self.show_lyrics = not self.show_lyrics
+        title_color = COLORS.get('accent')
+        hint_color = COLORS.get('foreground')
+        title_label = self.query_one("#visualizer-title", Label)
+        display_label = self.query_one("#visualizer-display", Label)
+
+        if self.show_lyrics:
+            title_label.update(f"[bold {title_color}]LYRICS[/] [{hint_color}](Ctrl+L: Spectrum)[/]")
+            display_label.add_class("lyrics-mode")
+            self.render_lyrics()
+        else:
+            title_label.update(f"[bold {title_color}]LIVE AUDIO SPECTRUM[/] [{hint_color}](Ctrl+L: Lyrics)[/]")
+            display_label.remove_class("lyrics-mode")
+
+    def load_lyrics_for_song(self, song_info: dict) -> None:
+        """Pobiera tekst utworu w tle, aby nie blokować interfejsu."""
+        target_path = song_info["path"]
+        self.synced_lyrics = []
+        self.plain_lyrics = []
+        self.lyrics_status = "⏳ Searching lyrics..."
+
+        def worker():
+            synced, plain = fetch_lrclib_lyrics(target_path, song_info["artist"], song_info["title"])
+            if self.active_song_path == target_path:
+                self.synced_lyrics = synced
+                self.plain_lyrics = plain
+                if not synced and not plain:
+                    self.lyrics_status = "No lyrics found"
+                else:
+                    self.lyrics_status = ""
+
+        self.run_worker(worker, thread=True)
+
+    def render_lyrics(self) -> None:
+        """Wyświetla zsynchronizowany (lub zwykły) tekst utworu w oknie wizualizatora."""
+        try:
+            display_label = self.query_one("#visualizer-display", Label)
+            height = display_label.size.height
+            if height <= 0:
+                return
+
+            accent = COLORS.get("accent", "#F7DFB1")
+            fg = COLORS.get("foreground", "#A8A890")
+
+            if self.synced_lyrics:
+                curr_pos = self.playback.curr_pos if self.playback.active else 0.0
+                active_idx = 0
+                for i, (ts, _) in enumerate(self.synced_lyrics):
+                    if ts <= curr_pos + 0.3:
+                        active_idx = i
+                    else:
+                        break
+
+                half = height // 2
+                start = max(0, active_idx - half)
+                end = min(len(self.synced_lyrics), start + height)
+                if end - start < height:
+                    start = max(0, end - height)
+
+                rendered = []
+                for i in range(start, end):
+                    text = escape(self.synced_lyrics[i][1])
+                    if i == active_idx:
+                        rendered.append(f"[bold {accent}]{text}[/]")
+                    else:
+                        rendered.append(f"[{fg}]{text}[/]")
+                display_label.update("\n".join(rendered))
+
+            elif self.plain_lyrics:
+                total_lines = len(self.plain_lyrics)
+                if total_lines <= height:
+                    start = 0
+                else:
+                    pct = (self.playback.curr_pos / self.playback.duration) if (self.playback.active and self.playback.duration > 0) else 0.0
+                    start = int(pct * (total_lines - height))
+                chunk = [f"[{fg}]{escape(l)}[/]" for l in self.plain_lyrics[start:start + height]]
+                display_label.update("\n".join(chunk))
+
+            else:
+                display_label.update(f"[{fg}]{escape(self.lyrics_status)}[/]")
+        except Exception:
+            pass
+
     def update_active_highlight(self) -> None:
         playlist_names = list(self.playlists.keys())
         try:
@@ -383,7 +543,6 @@ class Termusic(App):
                 item.add_class("active-item")
 
     def action_auto_tag_deezer(self) -> None:
-        """Uruchamia w tle rozpoznawanie nieotagowanych utworów przez Deezer API."""
         self.query_one("#now-playing", Label).update("🔍 Scanning library with Deezer API...")
         
         def tagger_worker():
@@ -516,7 +675,6 @@ ascii_max_range = 1000
             self.push_screen(DownloadYoutubeModal(), handle_yt_result)
 
     def download_youtube_song(self, url: str) -> None:
-        # Zapisujemy do folderu aktywnej playlisty (jeśli istnieje jako folder) lub do ~/Music/Downloads
         if self.active_playlist and (self.music_dir / self.active_playlist).is_dir():
             target_dir = self.music_dir / self.active_playlist
         else:
@@ -539,7 +697,6 @@ ascii_max_range = 1000
             try:
                 result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if result.returncode == 0:
-                    # Od razu rozpoznaj nowy plik przez Deezer API
                     after_files = set(target_dir.glob("*.mp3"))
                     new_files = after_files - before_files
                     for new_mp3 in new_files:
@@ -623,9 +780,11 @@ ascii_max_range = 1000
         self.playback.set_volume(self.volume)
         self.playback.play()
         
+        self.active_song_path = song_path
         self.active_song_name = song_info["display"]
         self.query_one("#now-playing", Label).update(f"🎶 Playing: {self.active_song_name}")
         self.update_progress_ui(0)
+        self.load_lyrics_for_song(song_info)
         
         if index == -1:
             songs = self.playlists.get(self.active_playlist, [])
@@ -697,10 +856,16 @@ ascii_max_range = 1000
                 self.action_next_song()
                 return
             self.update_progress_ui(self.playback.curr_pos / self.playback.duration)
-            self.render_live_audio_spectrum(is_playing=True)
+            if self.show_lyrics:
+                self.render_lyrics()
+            else:
+                self.render_live_audio_spectrum(is_playing=True)
         else:
             self.update_progress_ui(0.0)
-            self.render_live_audio_spectrum(is_playing=False)
+            if self.show_lyrics:
+                self.render_lyrics()
+            else:
+                self.render_live_audio_spectrum(is_playing=False)
 
     def render_live_audio_spectrum(self, is_playing: bool) -> None:
         try:
