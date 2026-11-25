@@ -20,6 +20,8 @@ from just_playback import Playback
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
 
+ALL_SONGS_PLAYLIST = "All Songs"
+
 # Ścieżka do aktywnego motywu w Omarchy
 OMARCHY_COLORS_PATH = Path.home() / ".config" / "omarchy" / "current" / "theme" / "colors.toml"
 
@@ -119,7 +121,6 @@ def fetch_lrclib_lyrics(song_path: Path, artist: str, title: str) -> tuple[list[
     headers = {"User-Agent": "Termusic/1.0 (https://github.com/rudyyyv4/Termusic)"}
     data = None
 
-    # 1. Dokładne wyszukiwanie po tagach artist + title
     if artist and title:
         try:
             params = urllib.parse.urlencode({"artist_name": artist, "track_name": title})
@@ -130,7 +131,6 @@ def fetch_lrclib_lyrics(song_path: Path, artist: str, title: str) -> tuple[list[
         except Exception:
             data = None
 
-    # 2. Wyszukiwanie ogólne po nazwie (fallback)
     if not data:
         query = f"{artist} {title}".strip() if (artist or title) else clean_filename_for_search(song_path.stem)
         if query:
@@ -141,7 +141,6 @@ def fetch_lrclib_lyrics(song_path: Path, artist: str, title: str) -> tuple[list[
                 with urllib.request.urlopen(req, timeout=6) as resp:
                     results = json.loads(resp.read().decode("utf-8"))
                     if isinstance(results, list) and results:
-                        # Preferuj wynik z zsynchronizowanym tekstem
                         data = next((r for r in results if r.get("syncedLyrics")), results[0])
             except Exception:
                 data = None
@@ -196,6 +195,88 @@ def write_mp3_tags(song_path: Path, title: str, artist: str, album: str) -> bool
         return True
     except Exception:
         return False
+
+
+class SearchAlbumModal(ModalScreen[tuple[str | None, Path | None]]):
+    """Wyszukuje album po nazwie albumu albo po utworze (tytuł / wykonawca / plik)."""
+    CSS = f"""
+    SearchAlbumModal {{ align: center middle; background: rgba(0, 0, 0, 0.75); }}
+    #search-dialog {{ width: 62; height: 18; background: #000000; border: solid {COLORS.get('color4')}; padding: 1; }}
+    #search-dialog > Label {{ text-style: bold; color: {COLORS.get('accent')}; margin-bottom: 1; }}
+    Input {{ border: tall {COLORS.get('color4')}; background: transparent; color: {COLORS.get('foreground')}; margin-bottom: 1; }}
+    #search-results {{ height: 1fr; border: none; background: transparent; }}
+    #search-results > ListItem {{ padding: 0 1; color: {COLORS.get('foreground')}; }}
+    #search-results > ListItem.--highlight {{ background: transparent; color: {COLORS.get('accent')}; text-style: bold; }}
+    """
+
+    def __init__(self, playlists: dict):
+        super().__init__()
+        self.playlists = playlists
+        self.matches: list[tuple[str, Path | None, str]] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="search-dialog"):
+            yield Label("Search album or song inside album:")
+            yield Input(placeholder="Type album name or song title...", id="search-input")
+            yield ListView(id="search-results")
+
+    def on_mount(self) -> None:
+        self.query_one("#search-input", Input).focus()
+        self.update_matches("")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self.update_matches(event.value.strip().lower())
+
+    def update_matches(self, query: str) -> None:
+        results_view = self.query_one("#search-results", ListView)
+        results_view.clear()
+        self.matches.clear()
+
+        for album_name, songs in self.playlists.items():
+            if album_name == ALL_SONGS_PLAYLIST:
+                continue
+
+            album_match = not query or (query in album_name.lower())
+            matched_song = None
+
+            if query:
+                for song in songs:
+                    haystack = f"{song.get('display', '')} {song.get('title', '')} {song.get('artist', '')} {song['path'].stem}".lower()
+                    if query in haystack:
+                        matched_song = song
+                        break
+
+            if album_match or matched_song:
+                if matched_song and not album_match:
+                    label = f"{album_name}  [song: {matched_song['display']}]"
+                    song_path = matched_song["path"]
+                else:
+                    label = f"{album_name} ({len(songs)} tracks)"
+                    song_path = matched_song["path"] if matched_song else None
+
+                self.matches.append((album_name, song_path, label))
+                results_view.append(ListItem(Label(escape(label))))
+
+        if results_view.children:
+            results_view.index = 0
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self.matches:
+            idx = self.query_one("#search-results", ListView).index or 0
+            if 0 <= idx < len(self.matches):
+                album_name, song_path, _ = self.matches[idx]
+                self.dismiss((album_name, song_path))
+                return
+        self.dismiss((None, None))
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self.matches):
+            album_name, song_path, _ = self.matches[idx]
+            self.dismiss((album_name, song_path))
+
+    def key_escape(self) -> None:
+        self.dismiss((None, None))
 
 
 class AddPlaylistModal(ModalScreen[str]):
@@ -310,6 +391,7 @@ class Termusic(App):
         Binding("a", "add_or_download", "Add/YT"),
         Binding("d", "delete_item", "Delete"),
         Binding("s", "auto_tag_deezer", "Auto-Tag"),
+        Binding("slash", "search_albums", "Search"),
         Binding("ctrl+l", "toggle_visualizer_mode", "Lyrics/Spec"),
         Binding(">", "next_song", "Next"),
         Binding("<", "prev_song", "Prev"),
@@ -375,6 +457,8 @@ class Termusic(App):
             self.music_dir.mkdir(parents=True, exist_ok=True)
             
         grouped = {}
+        all_tracks = []
+
         for path in sorted(self.music_dir.iterdir()):
             if path.is_dir() and not list(path.glob("*.mp3")):
                 grouped[path.name] = []
@@ -395,18 +479,57 @@ class Termusic(App):
             else:
                 display = mp3_path.stem
                 
-            grouped.setdefault(album, []).append({
+            track_entry = {
                 "path": mp3_path,
                 "display": display,
                 "title": title,
                 "artist": artist,
                 "album": album
-            })
+            }
+            grouped.setdefault(album, []).append(track_entry)
+            all_tracks.append(track_entry)
 
-        self.playlists = {
+        sorted_albums = {
             k: sorted(v, key=lambda x: x["display"].lower())
             for k, v in sorted(grouped.items(), key=lambda item: item[0].lower())
         }
+
+        ordered_playlists = {}
+        if all_tracks:
+            ordered_playlists[ALL_SONGS_PLAYLIST] = sorted(all_tracks, key=lambda x: x["display"].lower())
+        ordered_playlists.update(sorted_albums)
+        self.playlists = ordered_playlists
+
+    def action_search_albums(self) -> None:
+        """Otwiera wyszukiwarkę albumów po nazwie albumu lub po utworze."""
+        def on_search_done(result: tuple[str | None, Path | None]) -> None:
+            album_name, song_path = result
+            if not album_name or album_name not in self.playlists:
+                return
+
+            playlist_names = list(self.playlists.keys())
+            self.active_playlist = album_name
+            self.load_songs_to_ui(album_name)
+
+            playlist_list = self.query_one("#playlist-list", ListView)
+            if album_name in playlist_names:
+                playlist_list.index = playlist_names.index(album_name)
+
+            songs = self.playlists.get(album_name, [])
+            target_song_idx = 0
+            if song_path is not None:
+                for idx, s in enumerate(songs):
+                    if s["path"] == song_path:
+                        target_song_idx = idx
+                        break
+
+            self.update_active_highlight()
+            song_list = self.query_one("#song-list", ListView)
+            if songs:
+                song_list.index = target_song_idx
+                song_list.focus()
+
+        self.push_screen(SearchAlbumModal(self.playlists), on_search_done)
 
     def compose(self) -> ComposeResult:
         title_color = COLORS.get('accent')
@@ -416,7 +539,7 @@ class Termusic(App):
         with Horizontal(id="layout"):
             with Grid(id="left-sidebar"):
                 with Vertical(classes="column", id="playlists-container"):
-                    yield Label(f"[bold {title_color}]ALBUMS / PLAYLISTS[/]\n[{hint_color}](Press 's' Auto-Tag | 'a' Add | 'd' Del)[/]")
+                    yield Label(f"[bold {title_color}]ALBUMS / PLAYLISTS[/]\n[{hint_color}]('/' Search | 's' Tag | 'a' Add | 'd' Del)[/]")
                     yield ListView(id="playlist-list")
                 with Vertical(classes="column", id="visualizer-container"):
                     yield Label(f"[bold {title_color}]LIVE AUDIO SPECTRUM[/] [{hint_color}](Ctrl+L: Lyrics)[/]", id="visualizer-title")
@@ -441,7 +564,6 @@ class Termusic(App):
         self.run_worker(self.cava_listener_worker, thread=True)
 
     def action_toggle_visualizer_mode(self) -> None:
-        """Przełącza dolny lewy panel między CAVA Spectrum a tekstami piosenek (Ctrl+L)."""
         self.show_lyrics = not self.show_lyrics
         title_color = COLORS.get('accent')
         hint_color = COLORS.get('foreground')
@@ -457,7 +579,6 @@ class Termusic(App):
             display_label.remove_class("lyrics-mode")
 
     def load_lyrics_for_song(self, song_info: dict) -> None:
-        """Pobiera tekst utworu w tle, aby nie blokować interfejsu."""
         target_path = song_info["path"]
         self.synced_lyrics = []
         self.plain_lyrics = []
@@ -476,7 +597,6 @@ class Termusic(App):
         self.run_worker(worker, thread=True)
 
     def render_lyrics(self) -> None:
-        """Wyświetla zsynchronizowany (lub zwykły) tekst utworu w oknie wizualizatora."""
         try:
             display_label = self.query_one("#visualizer-display", Label)
             height = display_label.size.height
@@ -637,7 +757,7 @@ ascii_max_range = 1000
         playlist_list = self.query_one("#playlist-list", ListView)
         playlist_list.clear()
         for name in self.playlists.keys():
-            playlist_list.append(ListItem(Label(name)))
+            playlist_list.append(ListItem(Label(escape(name))))
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         list_id = event.list_view.id
@@ -661,7 +781,7 @@ ascii_max_range = 1000
         song_list = self.query_one("#song-list", ListView)
         if playlist_list.has_focus:
             def handle_modal_result(playlist_name: str) -> None:
-                if playlist_name:
+                if playlist_name and playlist_name != ALL_SONGS_PLAYLIST:
                     new_dir = self.music_dir / playlist_name
                     try:
                         new_dir.mkdir(exist_ok=False)
@@ -675,7 +795,7 @@ ascii_max_range = 1000
             self.push_screen(DownloadYoutubeModal(), handle_yt_result)
 
     def download_youtube_song(self, url: str) -> None:
-        if self.active_playlist and (self.music_dir / self.active_playlist).is_dir():
+        if self.active_playlist and self.active_playlist != ALL_SONGS_PLAYLIST and (self.music_dir / self.active_playlist).is_dir():
             target_dir = self.music_dir / self.active_playlist
         else:
             target_dir = self.music_dir / "Downloads"
@@ -730,6 +850,9 @@ ascii_max_range = 1000
             playlist_index = playlist_list.index
             if playlist_index is not None and 0 <= playlist_index < len(playlist_names):
                 playlist_to_delete = playlist_names[playlist_index]
+                if playlist_to_delete == ALL_SONGS_PLAYLIST:
+                    self.query_one("#now-playing", Label).update("ℹ️ 'All Songs' cannot be deleted")
+                    return
                 def handle_delete_confirm(confirmed: bool) -> None:
                     if confirmed:
                         try:
@@ -772,7 +895,7 @@ ascii_max_range = 1000
         song_list_view.clear()
         songs = self.playlists.get(playlist_name, [])
         for i, song in enumerate(songs):
-            song_list_view.append(ListItem(Label(f"{i+1}. {song['display']}")))
+            song_list_view.append(ListItem(Label(escape(f"{i+1}. {song['display']}"))))
 
     def play_song(self, song_info: dict, index: int = -1) -> None:
         song_path = song_info["path"]
@@ -782,7 +905,7 @@ ascii_max_range = 1000
         
         self.active_song_path = song_path
         self.active_song_name = song_info["display"]
-        self.query_one("#now-playing", Label).update(f"🎶 Playing: {self.active_song_name}")
+        self.query_one("#now-playing", Label).update(f"🎶 Playing: {escape(self.active_song_name)}")
         self.update_progress_ui(0)
         self.load_lyrics_for_song(song_info)
         
@@ -949,7 +1072,7 @@ ascii_max_range = 1000
             else:
                 self.playback.resume()
                 song_name = getattr(self, 'active_song_name', 'music')
-                self.query_one("#now-playing", Label).update(f"🎶 Playing: {song_name}")
+                self.query_one("#now-playing", Label).update(f"🎶 Playing: {escape(song_name)}")
 
     def action_back_to_playlists(self) -> None:
         self.query_one("#playlist-list").focus()
