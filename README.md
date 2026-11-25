@@ -60,18 +60,18 @@ Global command (run `termusic` from anywhere):
   chmod +x ~/.local/bin/termusic
 `
 
-## Keybindings
-
-* Space — Play / Pause
-* Enter — Select Album / Play Track
-* Esc — Focus back to Albums / Playlists
-* / — Search Albums or Tracks
-* < / >— Next / Previous Track
-* } / { — Volume +5% / -5% (up to 200% boost)
-* L — Toggle Loop
-* R — Toggle Random (Shuffle)
-* Ctrl+L — Toggle Live Audio Spectrum / Synced Lyrics
-* s — Auto-tag untagged audio files via Deezer API
-* a — Add Playlist (in Albums) / Download from YouTube (in Tracks)
-* d — Delete selected Album or Track
-* q — Quit
+| Key | Action |
+| :--- | :--- |
+| `Space` | Play / Pause |
+| `Enter` | Select Album / Play Track |
+| `Esc` | Focus back to Albums / Playlists |
+| `/` | Search Albums or Tracks |
+| `>` / `<` | Next / Previous Track |
+| `}` / `{` | Volume +5% / -5% (up to 200% boost) |
+| `L` | Toggle Loop |
+| `R` | Toggle Random (Shuffle) |
+| `Ctrl+L` | Toggle Live Audio Spectrum / Synced Lyrics |
+| `s` | Auto-tag untagged audio files via Deezer API |
+| `a` | Add Playlist (in Albums) / Download from YouTube (in Tracks) |
+| `d` | Delete selected Album or Track |
+| `q` | Quit |
