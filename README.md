@@ -31,24 +31,34 @@ Python packages (requirements.txt):
 ## Installation & Setup
 
 Install system packages:
+`
   sudo pacman -S python yt-dlp ffmpeg cava libpulse git
+`
 
 Clone repository:
+`
   git clone https://github.com/rudyyyv4/Termusic.git ~/TerminalMusic
   cd ~/TerminalMusic
+`
 
 Create a virtual environment and install Python packages:
+`
   python -m venv venv
   source venv/bin/activate
   pip install -r requirements.txt
+`
 
 Run:
+`
   python Main.py
+`
 
 Global command (run `termusic` from anywhere):
+`
   mkdir -p ~/.local/bin
   printf '#!/bin/bash\ncd ~/TerminalMusic\nsource venv/bin/activate\nexec python Main.py "$@"\n' > ~/.local/bin/termusic
   chmod +x ~/.local/bin/termusic
+`
 
 ## Keybindings
 
@@ -56,7 +66,7 @@ Global command (run `termusic` from anywhere):
 * Enter — Select Album / Play Track
 * Esc — Focus back to Albums / Playlists
 * / — Search Albums or Tracks
-* > / < — Next / Previous Track
+* < / >— Next / Previous Track
 * } / { — Volume +5% / -5% (up to 200% boost)
 * L — Toggle Loop
 * R — Toggle Random (Shuffle)
