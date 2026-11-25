@@ -31,34 +31,34 @@ Python packages (requirements.txt):
 ## Installation & Setup
 
 Install system packages:
-`
+```bash
   sudo pacman -S python yt-dlp ffmpeg cava libpulse git
-`
+```
 
 Clone repository:
-`
+```bash
   git clone https://github.com/rudyyyv4/Termusic.git ~/TerminalMusic
   cd ~/TerminalMusic
-`
+```
 
 Create a virtual environment and install Python packages:
-`
+```bash
   python -m venv venv
   source venv/bin/activate
   pip install -r requirements.txt
-`
+```
 
 Run:
-`
+```bash
   python Main.py
-`
+```
 
 Global command (run `termusic` from anywhere):
-`
+```bash
   mkdir -p ~/.local/bin
   printf '#!/bin/bash\ncd ~/TerminalMusic\nsource venv/bin/activate\nexec python Main.py "$@"\n' > ~/.local/bin/termusic
   chmod +x ~/.local/bin/termusic
-`
+```
 
 | Key | Action |
 | :--- | :--- |
