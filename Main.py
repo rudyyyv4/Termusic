@@ -19,8 +19,12 @@ from textual.binding import Binding
 from just_playback import Playback
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
+from mutagen import File as MutagenFile
 
 ALL_SONGS_PLAYLIST = "All Songs"
+RANDOM_HISTORY_SIZE = 5
+STATS_PATH = Path.home() / ".config" / "termusic" / "stats.json"
+
 
 # Ścieżka do aktywnego motywu w Omarchy
 OMARCHY_COLORS_PATH = Path.home() / ".config" / "omarchy" / "current" / "theme" / "colors.toml"
@@ -164,38 +168,86 @@ def fetch_lrclib_lyrics(song_path: Path, artist: str, title: str) -> tuple[list[
     return [], []
 
 
-def read_mp3_tags(song_path: Path) -> dict:
-    """Odczytuje tagi ID3 z pliku MP3."""
+def get_audio_duration(song_path: Path) -> float:
+    """Zwraca długość utworu w sekundach."""
     try:
-        audio = EasyID3(str(song_path))
-        title = audio.get("title", [""])[0].strip()
-        artist = audio.get("artist", [""])[0].strip()
-        album = audio.get("album", [""])[0].strip()
+        audio = MutagenFile(str(song_path))
+        if audio and getattr(audio, "info", None) and getattr(audio.info, "length", None):
+            return float(audio.info.length)
+    except Exception:
+        pass
+    return 0.0
+
+
+def format_duration_hms(total_seconds: float) -> str:
+    """Formatuje sekundy jako HH:MM:SS lub MM:SS."""
+    sec = max(0, int(round(total_seconds)))
+    hours, rem = divmod(sec, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def load_album_play_stats() -> dict:
+    """Wczytuje licznik odtworzeń dla albumów."""
+    try:
+        if STATS_PATH.exists():
+            data = json.loads(STATS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def save_album_play_stats(stats: dict) -> None:
+    """Zapisuje licznik odtworzeń dla albumów."""
+    try:
+        STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATS_PATH.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def read_audio_tags(song_path: Path) -> dict:
+    """Odczytuje tagi (title, artist, album) z MP3 oraz FLAC."""
+    try:
+        audio = MutagenFile(str(song_path), easy=True)
+        if not audio:
+            return {"title": "", "artist": "", "album": ""}
+        title = (audio.get("title") or [""])[0].strip()
+        artist = (audio.get("artist") or [""])[0].strip()
+        album = (audio.get("album") or [""])[0].strip()
         return {"title": title, "artist": artist, "album": album}
     except Exception:
         return {"title": "", "artist": "", "album": ""}
 
 
-def write_mp3_tags(song_path: Path, title: str, artist: str, album: str) -> bool:
-    """Zapisuje tagi ID3 bezpośrednio do pliku MP3."""
+def write_audio_tags(song_path: Path, title: str, artist: str, album: str) -> bool:
+    """Zapisuje tagi do MP3 oraz FLAC."""
     try:
-        try:
-            audio = EasyID3(str(song_path))
-        except ID3NoHeaderError:
-            audio = EasyID3()
-            audio.save(str(song_path))
-            audio = EasyID3(str(song_path))
+        audio = MutagenFile(str(song_path), easy=True)
+        if audio is None:
+            if song_path.suffix.lower() == ".mp3":
+                try:
+                    audio = EasyID3(str(song_path))
+                except ID3NoHeaderError:
+                    audio = EasyID3()
+                    audio.save(str(song_path))
+                    audio = EasyID3(str(song_path))
+            else:
+                return False
         if title:
-            audio["title"] = title
+            audio["title"] = [title] if isinstance(audio.get("title"), list) else title
         if artist:
-            audio["artist"] = artist
+            audio["artist"] = [artist] if isinstance(audio.get("artist"), list) else artist
         if album:
-            audio["album"] = album
-        audio.save(str(song_path))
+            audio["album"] = [album] if isinstance(audio.get("album"), list) else album
+        audio.save()
         return True
     except Exception:
         return False
-
 
 class SearchAlbumModal(ModalScreen[tuple[str | None, Path | None]]):
     """Wyszukuje album po nazwie albumu albo po utworze (tytuł / wykonawca / plik)."""
@@ -279,6 +331,31 @@ class SearchAlbumModal(ModalScreen[tuple[str | None, Path | None]]):
         self.dismiss((None, None))
 
 
+class InfoModal(ModalScreen[None]):
+    CSS = f"""
+    InfoModal {{ align: center middle; background: rgba(0, 0, 0, 0.78); }}
+    #info-dialog {{ width: 64; height: auto; max-height: 24; background: #000000; border: solid {{COLORS.get('color4')}}; padding: 1 2; }}
+    #info-title {{ text-style: bold; color: {{COLORS.get('accent')}}; margin-bottom: 1; }}
+    #info-body {{ color: {{COLORS.get('foreground')}}; margin-bottom: 1; }}
+    #info-hint {{ color: {{COLORS.get('color1')}}; text-align: right; }}
+    """
+
+    def __init__(self, title: str, body: str):
+        super().__init__()
+        self.info_title = title
+        self.info_body = body
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="info-dialog"):
+            yield Label(escape(self.info_title), id="info-title")
+            yield Label(self.info_body, id="info-body")
+            yield Label("[Enter / Esc / q] Close", id="info-hint")
+
+    def on_key(self, event) -> None:
+        if event.key in ("enter", "escape", "q"):
+            self.dismiss(None)
+
+
 class AddPlaylistModal(ModalScreen[str]):
     CSS = f"""
     AddPlaylistModal {{ align: center middle; background: rgba(0, 0, 0, 0.7); }}
@@ -359,11 +436,14 @@ class Termusic(App):
     #visualizer-display {{ color: {COLORS.get('color1')}; text-align: center; width: 100%; height: 100%; content-align: center bottom; background: transparent; }}
     #visualizer-display.lyrics-mode {{ color: {COLORS.get('foreground')}; content-align: center middle; }}
     
-    #modes-row {{ height: 1; width: 100%; text-align: center; text-style: bold; color: {COLORS.get('foreground')}; background: transparent; }}
+    #top-meta-row {{ layout: grid; grid-size: 2 1; grid-columns: 1fr auto; width: 100%; height: 1; background: transparent; }}
+    #modes-row {{ height: 1; width: 100%; text-align: left; text-style: bold; color: {COLORS.get('foreground')}; background: transparent; }}
+    #volume-box {{ layout: horizontal; width: auto; height: 1; align: right middle; background: transparent; }}
+    #volume-bar {{ width: 22; height: 1; text-align: right; color: {COLORS.get('foreground')}; background: transparent; }}
+    #volume-display {{ width: auto; height: 1; margin-left: 1; text-align: right; text-style: bold; color: {COLORS.get('accent')}; background: transparent; }}
     
-    #status-row {{ layout: grid; grid-size: 3 1; grid-columns: 1fr 2fr 1fr; width: 100%; height: 1; background: transparent; }}
+    #status-row {{ layout: grid; grid-size: 1 1; width: 100%; height: 1; background: transparent; }}
     #now-playing {{ text-align: center; text-style: bold; color: {COLORS.get('accent')}; width: 100%; background: transparent; }}
-    #volume-display {{ text-align: right; color: {COLORS.get('foreground')}; width: 100%; background: transparent; }}
     
     #custom-progress-bar {{ width: 100%; height: 1; background: transparent; color: {COLORS.get('foreground')}; text-align: center; }}
     
@@ -393,6 +473,8 @@ class Termusic(App):
         Binding("s", "auto_tag_deezer", "Auto-Tag"),
         Binding("slash", "search_albums", "Search"),
         Binding("ctrl+l", "toggle_visualizer_mode", "Lyrics/Spec"),
+        Binding("I", "show_albums_info", "Albums Info"),
+        Binding("ctrl+i", "show_playlist_info", "Playlist Info"),
         Binding(">", "next_song", "Next"),
         Binding("<", "prev_song", "Prev"),
         Binding("L", "toggle_loop", "Loop"),
@@ -417,8 +499,13 @@ class Termusic(App):
         
         self.playback = Playback()
         self.volume = 1.0
+        self.max_volume = 2.0
+        self.last_beep_pct = None
         self.is_loop_active = False
         self.is_random_active = False
+        self.random_history_size = RANDOM_HISTORY_SIZE
+        self.recent_random_paths: list[Path] = []
+        self.album_play_stats = load_album_play_stats()
         self.spectrum_buffer = []
         self.cava_process = None
         self.scan_music()
@@ -460,11 +547,11 @@ class Termusic(App):
         all_tracks = []
 
         for path in sorted(self.music_dir.iterdir()):
-            if path.is_dir() and not list(path.glob("*.mp3")):
+            if path.is_dir() and not any(x.suffix.lower() in {".mp3", ".flac"} for x in path.glob("*")):
                 grouped[path.name] = []
 
-        for mp3_path in sorted(self.music_dir.rglob("*.mp3")):
-            tags = read_mp3_tags(mp3_path)
+        for mp3_path in sorted(x for x in self.music_dir.rglob("*") if x.suffix.lower() in {".mp3", ".flac"}):
+            tags = read_audio_tags(mp3_path)
             album = tags["album"]
             artist = tags["artist"]
             title = tags["title"]
@@ -548,11 +635,13 @@ class Termusic(App):
                 yield Label(f"[bold {title_color}]TRACKS[/]\n[{hint_color}](Press 'a' Download YT | 'd' Delete)[/]")
                 yield ListView(id="song-list")
         with Vertical(id="now-playing-container"):
-            yield Label("", id="modes-row")
+            with Horizontal(id="top-meta-row"):
+                yield Label("", id="modes-row")
+                with Horizontal(id="volume-box"):
+                    yield Label("██████████──────────", id="volume-bar")
+                    yield Label("[100%]", id="volume-display")
             with Horizontal(id="status-row"):
-                yield Label("") 
                 yield Label("Status: Not playing", id="now-playing")
-                yield Label("[100%]", id="volume-display")
             yield Label("00:00 ──────────────────────────────────────── 00:00", id="custom-progress-bar")
         yield Footer()
 
@@ -666,10 +755,10 @@ class Termusic(App):
         self.query_one("#now-playing", Label).update("🔍 Scanning library with Deezer API...")
         
         def tagger_worker():
-            all_mp3s = list(self.music_dir.rglob("*.mp3"))
+            all_mp3s = [x for x in self.music_dir.rglob("*") if x.suffix.lower() in {".mp3", ".flac"}]
             to_tag = []
             for p in all_mp3s:
-                tags = read_mp3_tags(p)
+                tags = read_audio_tags(p)
                 if not tags["album"] or not tags["artist"] or not tags["title"]:
                     to_tag.append(p)
             
@@ -687,7 +776,7 @@ class Termusic(App):
                 query = clean_filename_for_search(mp3_path.stem)
                 meta = fetch_deezer_metadata(query)
                 if meta and meta["album"]:
-                    if write_mp3_tags(mp3_path, meta["title"], meta["artist"], meta["album"]):
+                    if write_audio_tags(mp3_path, meta["title"], meta["artist"], meta["album"]):
                         tagged_count += 1
                         
             self.call_from_thread(self.on_tagging_finished, tagged_count, total)
@@ -824,7 +913,7 @@ ascii_max_range = 1000
                         query = clean_filename_for_search(new_mp3.stem)
                         meta = fetch_deezer_metadata(query)
                         if meta and meta["album"]:
-                            write_mp3_tags(new_mp3, meta["title"], meta["artist"], meta["album"])
+                            write_audio_tags(new_mp3, meta["title"], meta["artist"], meta["album"])
                     self.call_from_thread(self.on_download_success)
                 else:
                     self.call_from_thread(self.on_download_error, "❌ Download failed (yt-dlp error)")
@@ -900,10 +989,14 @@ ascii_max_range = 1000
     def play_song(self, song_info: dict, index: int = -1) -> None:
         song_path = song_info["path"]
         self.playback.load_file(str(song_path))
-        self.playback.set_volume(self.volume)
+        self.apply_volume_with_boost()
         self.playback.play()
         
         self.active_song_path = song_path
+        album_key = song_info.get("album") or self.active_playlist
+        if album_key and album_key != ALL_SONGS_PLAYLIST:
+            self.album_play_stats[album_key] = self.album_play_stats.get(album_key, 0) + 1
+            save_album_play_stats(self.album_play_stats)
         self.active_song_name = song_info["display"]
         self.query_one("#now-playing", Label).update(f"🎶 Playing: {escape(self.active_song_name)}")
         self.update_progress_ui(0)
@@ -930,7 +1023,24 @@ ascii_max_range = 1000
         if not songs: return
         
         if self.is_random_active:
-            self.current_song_index = random.randint(0, len(songs) - 1)
+            history_limit = max(0, int(self.random_history_size))
+            blocked_paths = set(self.recent_random_paths[-history_limit:]) if history_limit > 0 else set()
+            if self.active_song_path and len(songs) > 1:
+                blocked_paths.add(self.active_song_path)
+
+            candidates = [idx for idx, s in enumerate(songs) if s["path"] not in blocked_paths]
+            if not candidates:
+                # Jeśli wszystkie utwory są na liście historii, wyczyść historię poza bieżącym utworem
+                self.recent_random_paths = [self.active_song_path] if self.active_song_path else []
+                candidates = [idx for idx, s in enumerate(songs) if s["path"] != self.active_song_path] or list(range(len(songs)))
+
+            chosen_idx = random.choice(candidates)
+            chosen_song = songs[chosen_idx]
+            self.current_song_index = chosen_idx
+            if history_limit > 0:
+                self.recent_random_paths = [p for p in self.recent_random_paths if p != chosen_song["path"]]
+                self.recent_random_paths.append(chosen_song["path"])
+                self.recent_random_paths = self.recent_random_paths[-history_limit:]
         else:
             self.current_song_index += 1
             if self.current_song_index >= len(songs):
@@ -1054,15 +1164,88 @@ ascii_max_range = 1000
         except Exception:
             pass
 
+    def play_volume_beep(self, count: int) -> None:
+        def _worker():
+            try:
+                single_beep = (
+                    "sine=frequency=980:duration=0.07,"
+                    "afade=t=in:d=0.008,afade=t=out:st=0.05:d=0.02,"
+                    "apad=pad_dur=0.06"
+                )
+                chain = ",".join([single_beep] * count)
+                proc = subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", chain,
+                        "-f", "wav", "-"
+                    ],
+                    capture_output=True,
+                    timeout=3,
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    player = shutil.which("ffplay") or shutil.which("pw-play") or shutil.which("paplay")
+                    if player and player.endswith("ffplay"):
+                        subprocess.run(
+                            [player, "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "-"],
+                            input=proc.stdout,
+                            timeout=3,
+                        )
+                    elif player and player.endswith("pw-play"):
+                        subprocess.run([player, "-"], input=proc.stdout, timeout=3)
+                    elif player and player.endswith("paplay"):
+                        subprocess.run([player], input=proc.stdout, timeout=3)
+            except Exception:
+                pass
+
+        self.run_worker(_worker, thread=True)
+
+    def apply_volume_with_boost(self) -> None:
+        pct = int(round(self.volume * 100))
+        base_vol = min(1.0, self.volume)
+        self.playback.set_volume(base_vol)
+
+        # Podbicie powyżej 100% przez PulseAudio / PipeWire sink
+        try:
+            if pct > 100:
+                subprocess.run(
+                    ["pactl", "set-sink-volume", "TerminalMusicSink", f"{pct}%"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            else:
+                subprocess.run(
+                    ["pactl", "set-sink-volume", "TerminalMusicSink", "100%"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+        except Exception:
+            pass
+
+        vol_label = self.query_one("#volume-display", Label)
+        bar_len = 20
+        ratio = min(1.0, max(0.0, pct / 200.0))
+        filled = int(round(bar_len * ratio))
+        bar_str = "█" * filled + "─" * (bar_len - filled)
+        self.query_one("#volume-bar", Label).update(bar_str)
+
+        if pct > 100:
+            vol_label.update(f"[BOOST {pct}%]")
+        else:
+            vol_label.update(f"[{pct}%]")
+
+        milestone_beeps = {100: 1, 150: 2, 200: 3}
+        if pct in milestone_beeps:
+            if self.last_beep_pct != pct:
+                self.last_beep_pct = pct
+                self.play_volume_beep(milestone_beeps[pct])
+        else:
+            self.last_beep_pct = None
+
     def action_volume_up(self) -> None:
-        self.volume = min(1.0, self.volume + 0.05)
-        self.playback.set_volume(self.volume)
-        self.query_one("#volume-display", Label).update(f"[{int(round(self.volume * 100))}%]")
+        self.volume = min(self.max_volume, round(self.volume + 0.05, 4))
+        self.apply_volume_with_boost()
 
     def action_volume_down(self) -> None:
-        self.volume = max(0.0, self.volume - 0.05)
-        self.playback.set_volume(self.volume)
-        self.query_one("#volume-display", Label).update(f"[{int(round(self.volume * 100))}%]")
+        self.volume = max(0.0, round(self.volume - 0.05, 4))
+        self.apply_volume_with_boost()
 
     def action_toggle_pause(self) -> None:
         if self.playback.active:
@@ -1073,6 +1256,80 @@ ascii_max_range = 1000
                 self.playback.resume()
                 song_name = getattr(self, 'active_song_name', 'music')
                 self.query_one("#now-playing", Label).update(f"🎶 Playing: {escape(song_name)}")
+
+    def action_show_albums_info(self) -> None:
+        """Wyświetla informacje o albumach: liczba, łączny czas odsłuchu i najczęściej słuchany album."""
+        accent = COLORS.get("accent", "#F7DFB1")
+        fg = COLORS.get("foreground", "#A8A890")
+
+        album_items = [(name, tracks) for name, tracks in self.playlists.items() if name != ALL_SONGS_PLAYLIST]
+        albums_count = len(album_items)
+
+        unique_paths = {}
+        for _, tracks in album_items:
+            for t in tracks:
+                unique_paths[t["path"]] = t
+
+        total_seconds = sum(get_audio_duration(path) for path in unique_paths.keys())
+        total_time_str = format_duration_hms(total_seconds)
+
+        most_played_text = "No play history yet"
+        if self.album_play_stats:
+            existing_stats = {k: v for k, v in self.album_play_stats.items() if v > 0}
+            if existing_stats:
+                top_album, top_count = max(existing_stats.items(), key=lambda item: item[1])
+                most_played_text = f"{escape(top_album)} ({top_count} plays)"
+
+        body = (
+            f"[{fg}]Total albums:[/{fg}] [bold {accent}]{albums_count}[/bold {accent}]\n"
+            f"[{fg}]Total listening time:[/{fg}] [bold {accent}]{escape(total_time_str)}[/bold {accent}]\n"
+            f"[{fg}]Most played album:[/{fg}] [bold {accent}]{most_played_text}[/bold {accent}]"
+        )
+        self.push_screen(InfoModal("Albums Information", body))
+
+    def action_show_playlist_info(self) -> None:
+        """Wyświetla informacje o aktualnej playliście / albumie: tytuł, wykonawca, czas i liczba piosenek."""
+        accent = COLORS.get("accent", "#F7DFB1")
+        fg = COLORS.get("foreground", "#A8A890")
+
+        target_name = self.active_playlist
+        if not target_name:
+            playlist_names = list(self.playlists.keys())
+            idx = self.query_one("#playlist-list", ListView).index
+            if idx is not None and 0 <= idx < len(playlist_names):
+                target_name = playlist_names[idx]
+
+        if not target_name or target_name not in self.playlists:
+            self.push_screen(InfoModal("Playlist / Album Information", f"[{fg}]No album or playlist selected.[/{fg}]"))
+            return
+
+        tracks = self.playlists.get(target_name, [])
+        song_count = len(tracks)
+        total_seconds = sum(get_audio_duration(t["path"]) for t in tracks)
+        total_time_str = format_duration_hms(total_seconds)
+
+        artists = []
+        for t in tracks:
+            artist = (t.get("artist") or "").strip()
+            if not artist and " - " in t.get("display", ""):
+                artist = t["display"].split(" - ", 1)[0].strip()
+            if artist and artist not in artists:
+                artists.append(artist)
+
+        if not artists:
+            artists_str = "Unknown Artist"
+        elif len(artists) <= 4:
+            artists_str = ", ".join(artists)
+        else:
+            artists_str = ", ".join(artists[:4]) + f" (+{len(artists) - 4} more)"
+
+        body = (
+            f"[{fg}]Title:[/{fg}] [bold {accent}]{escape(target_name)}[/bold {accent}]\n"
+            f"[{fg}]Artist(s):[/{fg}] [bold {accent}]{escape(artists_str)}[/bold {accent}]\n"
+            f"[{fg}]Duration:[/{fg}] [bold {accent}]{escape(total_time_str)}[/bold {accent}]\n"
+            f"[{fg}]Songs count:[/{fg}] [bold {accent}]{song_count}[/bold {accent}]"
+        )
+        self.push_screen(InfoModal("Playlist / Album Information", body))
 
     def action_back_to_playlists(self) -> None:
         self.query_one("#playlist-list").focus()
