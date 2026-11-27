@@ -334,10 +334,10 @@ class SearchAlbumModal(ModalScreen[tuple[str | None, Path | None]]):
 class InfoModal(ModalScreen[None]):
     CSS = f"""
     InfoModal {{ align: center middle; background: rgba(0, 0, 0, 0.78); }}
-    #info-dialog {{ width: 64; height: auto; max-height: 24; background: #000000; border: solid {{COLORS.get('color4')}}; padding: 1 2; }}
-    #info-title {{ text-style: bold; color: {{COLORS.get('accent')}}; margin-bottom: 1; }}
-    #info-body {{ color: {{COLORS.get('foreground')}}; margin-bottom: 1; }}
-    #info-hint {{ color: {{COLORS.get('color1')}}; text-align: right; }}
+    #info-dialog {{ width: 64; height: auto; max-height: 24; background: #000000; border: solid {COLORS.get('color4')}; padding: 1 2; }}
+    #info-title {{ text-style: bold; color: {COLORS.get('accent')}; margin-bottom: 1; }}
+    #info-body {{ color: {COLORS.get('foreground')}; margin-bottom: 1; }}
+    #info-hint {{ color: {COLORS.get('color1')}; text-align: right; }}
     """
 
     def __init__(self, title: str, body: str):
