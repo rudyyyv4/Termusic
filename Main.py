@@ -475,6 +475,9 @@ class Termusic(App):
         Binding("ctrl+l", "toggle_visualizer_mode", "Lyrics/Spec"),
         Binding("I", "show_albums_info", "Albums Info"),
         Binding("ctrl+i", "show_playlist_info", "Playlist Info"),
+        Binding("question_mark", "surprise_mode", "Surprise"),
+        Binding("left_square_bracket", "seek_backward", "Seek -5s"),
+        Binding("right_square_bracket", "seek_forward", "Seek +5s"),
         Binding(">", "next_song", "Next"),
         Binding("<", "prev_song", "Prev"),
         Binding("L", "toggle_loop", "Loop"),
@@ -1330,6 +1333,59 @@ ascii_max_range = 1000
             f"[{fg}]Songs count:[/{fg}] [bold {accent}]{song_count}[/bold {accent}]"
         )
         self.push_screen(InfoModal("Playlist / Album Information", body))
+
+    def action_surprise_mode(self) -> None:
+        """Tryb niespodzianki: wybiera losowy album i losowy utwór z tego albumu."""
+        album_names = [name for name in self.playlists.keys() if name != ALL_SONGS_PLAYLIST and self.playlists.get(name)]
+        if not album_names:
+            fallback = [name for name, tracks in self.playlists.items() if tracks]
+            if not fallback:
+                return
+            album_names = fallback
+
+        chosen_album = random.choice(album_names)
+        tracks = self.playlists.get(chosen_album, [])
+        if not tracks:
+            return
+
+        chosen_idx = random.randrange(len(tracks))
+        all_playlist_names = list(self.playlists.keys())
+        playlist_list = self.query_one("#playlist-list", ListView)
+        song_list = self.query_one("#song-list", ListView)
+
+        self.active_playlist = chosen_album
+        if chosen_album in all_playlist_names:
+            playlist_list.index = all_playlist_names.index(chosen_album)
+
+        song_list.clear()
+        for track in tracks:
+            song_list.append(ListItem(Label(escape(track["display"]))))
+        song_list.index = chosen_idx
+
+        self.play_song(tracks[chosen_idx], chosen_idx)
+        self.notify(f"Surprise: {chosen_album} — {tracks[chosen_idx]['display']}")
+
+    def _seek_relative(self, delta_seconds: float) -> None:
+        """Przewija aktualny utwór o podaną liczbę sekund."""
+        if not self.active_song_path:
+            return
+        try:
+            current_pos = float(self.playback.curr_pos or 0.0)
+            target_pos = max(0.0, current_pos + delta_seconds)
+            duration = float(self.playback.duration or 0.0)
+            if duration > 0:
+                target_pos = min(target_pos, max(0.0, duration - 0.5))
+            self.playback.seek(target_pos)
+        except Exception:
+            pass
+
+    def action_seek_backward(self) -> None:
+        """Cofa utwór o 5 sekund."""
+        self._seek_relative(-5.0)
+
+    def action_seek_forward(self) -> None:
+        """Przewija utwór o 5 sekund do przodu."""
+        self._seek_relative(5.0)
 
     def action_back_to_playlists(self) -> None:
         self.query_one("#playlist-list").focus()
